@@ -1,0 +1,13 @@
+<!-- orchestra:begin -->
+## Multi-model workflow (orchestra)
+The `orchestra` CLI routes work from whichever coding agent is reading this (Claude Code, Codex,
+Grok Build, Antigravity/agy, OpenCode, ...) to other models: your own subagents when the model is native
+to you, native CLIs (`claude`, `codex`, `grok`, `agy`), or OpenCode models, in a Docker container by default.
+- For work big enough to split, or when I say delegate/orchestrate, use the `orchestrate` skill:
+  you plan and integrate; other models implement in worktrees; two different models review.
+- Model and effort choices live in `orchestra models list` (global, plus a per-lead-agent override) —
+  never hard-code model names.
+- When spawning your own subagents, use the model/effort from `lead.explore` / `lead.task`
+  (if those name models your agent has).
+- Don't put secrets or private credentials in task files: they go to whichever models the roles name.
+<!-- orchestra:end -->

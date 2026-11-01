@@ -1,0 +1,996 @@
+#!/usr/bin/env bash
+# orchestra — route coding tasks from a lead coding agent to native subagents, native CLIs
+# (claude, codex, grok, agy) and OpenCode models.
+# Bash 3.2 compatible (macOS default shell).
+set -uo pipefail
+
+VERSION="0.2.0"
+GLOBAL_CONF="${ORCHESTRA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/orchestra/models.conf}"
+# Per-harness overrides: <dir>/<lead>.conf (claude.conf, codex.conf, ...), only the roles that differ.
+HARNESS_DIR="${ORCHESTRA_HARNESS_DIR:-$(dirname "$GLOBAL_CONF")/harness}"
+HARNESSES="claude codex grok agy opencode other"
+MAX_LINES="${ORCHESTRA_MAX_LINES:-60}"
+OPENCODE="${ORCHESTRA_OPENCODE:-opencode}"
+# Output that means "this model is unavailable, try the next one".
+FALLBACK_RE='ProviderModelNotFound|model not found|not supported|rate.?limit|429|quota|insufficient|unauthori[sz]ed|401|403|overloaded|503|usage limit'
+
+die() { echo "orchestra: $*" >&2; exit 1; }
+# Portable helpers (macOS ships shasum/uuidgen; minimal Linux may only have sha256sum and /proc).
+sha_of() { if command -v shasum >/dev/null; then shasum "$1"; else sha256sum "$1"; fi; }
+new_uuid() { { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid; } | tr 'A-Z' 'a-z'; }
+strip_ansi() { sed -e $'s/\x1b\\[[0-9;?]*[A-Za-z]//g' -e $'s/\r//g'; }
+
+# Main checkout (holds shared state: .orchestra/{runs,worktrees,setup.sh,models.conf}),
+# even when called from a linked worktree.
+repo_root() {
+  local c
+  c="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || die "not inside a git repository"
+  case "$c" in */.git) dirname "$c" ;; *) git rev-parse --show-toplevel ;; esac
+}
+
+# The caller's own checkout (a linked worktree or the main checkout).
+work_root() { git rev-parse --show-toplevel 2>/dev/null || die "not inside a git working tree"; }
+
+# Docker mounts only the main checkout; also mount a caller worktree that lives outside it.
+mount_if_outside() { # mount_if_outside <root> <dir>
+  case "$2" in "$1"|"$1"/*) ;; *) BOX_FLAGS=(-v "$2:$2:ro") ;; esac
+}
+
+# Kit install dir (for docker/Dockerfile), following the ~/.local/bin symlink.
+SELF="$0"; [ -L "$SELF" ] && SELF="$(readlink "$SELF")"
+KIT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+state_dir() {
+  local root d
+  root="$(repo_root)"
+  d="$root/.orchestra"
+  mkdir -p "$d/runs" "$d/worktrees" "$d/tasks"
+  # Keep orchestra state out of git without touching .gitignore.
+  local ex
+  ex="$(git -C "$root" rev-parse --git-path info/exclude)"
+  case "$ex" in /*) ;; *) ex="$root/$ex" ;; esac
+  mkdir -p "$(dirname "$ex")"
+  grep -qx '/.orchestra/' "$ex" 2>/dev/null || echo '/.orchestra/' >>"$ex"
+  echo "$d"
+}
+
+# ---------------------------------------------------------------- models ----
+
+conf_get() { # conf_get <file> <role>
+  [ -f "$1" ] || return 0
+  awk -v r="$2" '
+    /^[ \t]*#/ || index($0, "=") == 0 { next }
+    { k = substr($0, 1, index($0, "=") - 1); gsub(/[ \t]/, "", k) }
+    k == r { v = substr($0, index($0, "=") + 1); gsub(/[ \t]/, "", v); print v; exit }
+  ' "$1"
+}
+
+project_conf() {
+  local root
+  git rev-parse --git-dir >/dev/null 2>&1 || return 0
+  root="$(repo_root)"
+  [ -f "$root/.orchestra/models.conf" ] && echo "$root/.orchestra/models.conf"
+}
+
+harness_conf() { local f; f="$HARNESS_DIR/$(lead_agent).conf"; [ -f "$f" ] && echo "$f"; }
+
+# Config files, highest priority first: project, then the lead's harness, then global.
+conf_files() { project_conf; harness_conf; echo "$GLOBAL_CONF"; }
+
+conf_lookup() { # first file that sets the key, else empty
+  local f v
+  for f in $(conf_files); do
+    v="$(conf_get "$f" "$1")"; [ -n "$v" ] && { echo "$v"; return; }
+  done
+}
+
+# Prints the role's models, one per line.
+role_models() {
+  local v; v="$(conf_lookup "$1")"
+  [ -n "$v" ] || die "no models configured for role '$1' (see: orchestra models list)"
+  echo "$v" | tr ',' '\n' | sed '/^$/d'
+}
+
+all_roles() {
+  local f
+  for f in $(conf_files); do
+    [ -f "$f" ] && awk '/^[ \t]*#/ || index($0,"=")==0 {next}
+      { k=substr($0,1,index($0,"=")-1); gsub(/[ \t]/,"",k); print k }' "$f"
+  done | awk '!seen[$0]++'
+}
+
+# Which file sets a key ("project", "harness" or "global"), for `models list`.
+conf_source() {
+  local pc hc; pc="$(project_conf)"; hc="$(harness_conf)"
+  if [ -n "$pc" ] && [ -n "$(conf_get "$pc" "$1")" ]; then echo project
+  elif [ -n "$hc" ] && [ -n "$(conf_get "$hc" "$1")" ]; then echo harness
+  else echo global; fi
+}
+
+runtime() { local r="${ORCHESTRA_RUNTIME:-$(conf_lookup runtime)}"; echo "${r:-host}"; }
+
+# Which agent is leading, from the variable each harness sets for its shell commands.
+# Override with ORCHESTRA_LEAD=claude|codex|grok|agy|opencode|other.
+lead_agent() {
+  local l="${ORCHESTRA_LEAD:-}"
+  if [ -z "$l" ]; then
+    if [ -n "${CLAUDECODE:-}" ]; then l=claude
+    elif [ -n "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}" ]; then l=codex
+    elif [ -n "${GROK_SESSION_ID:-}" ]; then l=grok
+    elif [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then l=agy
+    elif [ -n "${OPENCODE_SESSION_ID:-}" ]; then l=opencode
+    fi
+  fi
+  echo "${l:-other}"
+}
+
+# Native CLIs orchestra drives directly (kind/model#effort); anything else is an OpenCode model.
+NATIVE_KINDS="claude codex grok agy"
+model_kind() { local k="${1%%/*}"; case " $NATIVE_KINDS " in *" $k "*) echo "$k" ;; *) echo opencode ;; esac; }
+
+# Where a model runs under the current lead (native first):
+#   subagent  the lead spawns it itself (Claude Code's Agent tool takes model + effort)
+#   host      the lead's own CLI, headless on this machine with its own login
+#   runtime   the configured runtime (docker container, or host)
+placement() {
+  local k; k="$(model_kind "$1")"
+  if [ "$k" != "$(lead_agent)" ]; then echo runtime
+  elif [ "$k" = claude ]; then echo subagent
+  else echo host; fi
+}
+
+# Models of a role (or "model:a b"), one per line.
+usable_models() {
+  case "$1" in model:*) echo "${1#model:}" | tr ' ' '\n' | sed '/^$/d' ;; *) role_models "$1" ;; esac
+}
+
+conf_set() { # conf_set <file> <role> <value>
+  local f="$1" tmp
+  mkdir -p "$(dirname "$f")"
+  [ -f "$f" ] || : >"$f"
+  tmp="$f.tmp.$$"
+  awk -v r="$2" -v val="$3" '
+    BEGIN { done = 0 }
+    !/^[ \t]*#/ && index($0, "=") > 0 {
+      k = substr($0, 1, index($0, "=") - 1); gsub(/[ \t]/, "", k)
+      if (k == r) { printf "%-8s = %s\n", r, val; done = 1; next }
+    }
+    { print }
+    END { if (!done) printf "%-8s = %s\n", r, val }
+  ' "$f" >"$tmp" && mv "$tmp" "$f"
+}
+
+# Codex models this login can use, one "slug effort effort ..." line each (hidden ones left out).
+# Cached per process, since doctor calls it from subshells.
+codex_models() { # codex_models <docker|host>
+  local cache="${TMPDIR:-/tmp}/orchestra-codex-models.$$.$1"
+  if [ ! -f "$cache" ]; then
+    local out=""
+    if [ "$1" = docker ]; then
+      if have_docker && docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+        local vols=() f; while IFS= read -r f; do vols+=("$f"); done < <(cli_vol_flags)
+        out="$(docker run --rm --user "$(id -u):$(id -g)" "${vols[@]}" "$BASE_IMAGE" codex debug models 2>/dev/null)"
+      fi
+    else out="$(codex debug models 2>/dev/null)"; fi
+    echo "$out" | jq -r '(.models // .)[] | select(.visibility != "hide")
+      | "\(.slug // .id) \((.supported_reasoning_levels // []) | map(.effort // .) | join(" "))"' >"$cache" 2>/dev/null
+  fi
+  cat "$cache"
+}
+
+is_harness() { case " $HARNESSES " in *" $1 "*) return 0 ;; esac; return 1; }
+
+cmd_models() {
+  local sub="${1:-list}"; shift || true
+  # list/get/doctor --harness <name>: act as if <name> were the lead.
+  if [ "$sub" != set ] && [ "${1:-}" = "--harness" ]; then
+    is_harness "${2:-}" || die "usage: orchestra models $sub --harness <$(echo $HARNESSES | tr ' ' '|')>"
+    export ORCHESTRA_LEAD="$2"; shift 2
+  fi
+  case "$sub" in
+    list)
+      local pc hc r
+      pc="$(project_conf)"; hc="$(harness_conf)"
+      echo "global:  $GLOBAL_CONF"
+      if [ -n "$hc" ]; then echo "harness: $hc"
+      else echo "harness: $HARNESS_DIR/$(lead_agent).conf (none; global only)"; fi
+      [ -n "$pc" ] && echo "project: $pc"
+      echo "  runtime         $(runtime)"
+      echo "  lead agent      $(lead_agent)"
+      for r in $(all_roles); do
+        [ "$r" = runtime ] && continue
+        [ -z "$(conf_lookup "$r")" ] && { printf '  %-15s %s\n' "$r" "(empty)"; continue; }
+        local src=""; [ "$(conf_source "$r")" != global ] && src="  [$(conf_source "$r")]"
+        printf '  %-15s %s%s\n' "$r" "$(role_models "$r" | paste -sd, - | sed 's/,/, /g')" "$src"
+      done ;;
+    get)
+      [ $# -ge 1 ] || die "usage: orchestra models get <role> [--harness <name>]"
+      [ "${2:-}" = "--harness" ] && { is_harness "${3:-}" || die "unknown harness '${3:-}'"; export ORCHESTRA_LEAD="$3"; }
+      role_models "$1" | head -1 ;;
+    set)
+      local target="$GLOBAL_CONF"
+      case "${1:-}" in
+        --project) target="$(state_dir)/models.conf"; shift ;;
+        --harness) shift
+          local h; h="$(lead_agent)"
+          if [ -n "${1:-}" ] && is_harness "$1"; then h="$1"; shift; fi
+          target="$HARNESS_DIR/$h.conf" ;;
+      esac
+      [ $# -ge 2 ] || die "usage: orchestra models set [--project | --harness [name]] <role> <model1,model2,...>"
+      local role="$1"; shift
+      local val; val="$(echo "$*" | tr ' ' ',' | sed 's/,,*/,/g; s/,/, /g')"
+      conf_set "$target" "$role" "$val"
+      echo "set $role = $val  ($target)" ;;
+    doctor)
+      local avail="" r m bad=0 where workers=0
+      for r in $(all_roles); do
+        case "$r" in lead.*|claude.*|runtime|timeout) continue ;; esac
+        [ -z "$(conf_lookup "$r")" ] && { echo "  empty   $r (no models configured)"; continue; }
+        workers=$((workers + 1))
+        for m in $(role_models "$r"); do
+          local k p; k="$(model_kind "$m")"; p="$(placement "$m")"
+          case "$p" in
+            subagent) echo "  ok      $r: $m (lead's own subagent)"; continue ;;
+            host) where="host" ;;
+            *) where="$(runtime)" ;;
+          esac
+          if [ "$k" = opencode ]; then
+            [ -z "$avail" ] && { avail="$("$OPENCODE" models 2>/dev/null | strip_ansi)" || avail=" "; }
+            if [ "$avail" = " " ]; then
+              echo "  ??      $r: $m (opencode isn't installed here; check with: orchestra docker models) [$where]"
+            elif echo "$avail" | grep -qx "${m%%#*}"; then
+              echo "  ok      $r: $m -> $(resolve_model "$m" 2>&1 | tail -1) [$where]"
+            else echo "  MISSING $r: $m"; bad=1; fi
+          elif [ "$k" = codex ] && { [ "$where" = docker ] || command -v codex >/dev/null; }; then
+            # Codex's catalog depends on the login (a ChatGPT plan offers fewer models than an API key).
+            local cm="${m#codex/}" cl; cl="$(codex_models "$where")"
+            if [ -z "$cl" ]; then echo "  ??      $r: $m (couldn't list Codex models; logged in? orchestra docker login codex) [$where]"
+            elif ! echo "$cl" | grep -q "^${cm%%#*} "; then
+              echo "  MISSING $r: $m (this Codex login offers: $(echo "$cl" | cut -d' ' -f1 | paste -sd, -)) [$where]"; bad=1
+            elif [ "${cm#*#}" != "$cm" ] && ! echo "$cl" | grep "^${cm%%#*} " | grep -q " ${cm#*#}\( \|$\)"; then
+              echo "  MISSING $r: $m (efforts: $(echo "$cl" | grep "^${cm%%#*} " | cut -d' ' -f2-)) [$where]"; bad=1
+            else echo "  ok      $r: $m (codex CLI) [$where]"; fi
+          elif [ "$where" = docker ] || command -v "$k" >/dev/null; then
+            echo "  ok      $r: $m ($k CLI) [$where]"
+          else echo "  MISSING $r: $m ($k CLI not installed on this machine)"; bad=1; fi
+        done
+      done
+      rm -f "${TMPDIR:-/tmp}"/orchestra-codex-models.$$.*
+      if [ "$workers" -eq 0 ]; then
+        echo "no worker roles configured yet. Edit $GLOBAL_CONF or run e.g.:"
+        echo "  orchestra models set build claude/sonnet,codex/<model>    (roles: cheap build review review2 research)"
+        return 1
+      fi
+      [ $bad -eq 0 ] && echo "all configured models are available" || {
+        echo "fix with: orchestra models set <role> <model,...>   (list: opencode models)"; return 1; } ;;
+    *) die "unknown: models $sub (list|get|set|doctor)" ;;
+  esac
+}
+
+# ----------------------------------------------------------------- runner ----
+
+MODELS_CACHE="${ORCHESTRA_MODELS_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/opencode/models.json}"
+
+# Effort levels a model supports, space separated (empty if unknown).
+model_efforts() { # model_efforts provider/model
+  [ -f "$MODELS_CACHE" ] && command -v jq >/dev/null || return 0
+  local p="${1%%/*}" id="${1#*/}"
+  jq -r --arg p "$p" --arg id "$id" \
+    '(.[$p].models[$id].reasoning_options // [])[] | select(.type=="effort") | .values | join(" ")' \
+    "$MODELS_CACHE" 2>/dev/null
+}
+
+# provider/model#effort -> provider/model#<supported effort>. "#max" = highest available.
+resolve_model() {
+  local spec="$1" base want levels
+  case "$spec" in *#*) ;; *) echo "$spec"; return ;; esac
+  base="${spec%%#*}"; want="${spec#*#}"
+  levels="$(model_efforts "$base")"
+  if [ -z "$levels" ]; then echo "$spec"; return; fi            # unknown: pass through
+  if echo " $levels " | grep -q " $want "; then echo "$spec"; return; fi
+  if [ "$want" = "max" ]; then echo "$base#${levels##* }"; return; fi
+  echo "  warning: $base has no '$want' effort (has: $levels); using default" >&2
+  echo "$base"
+}
+
+# ---------------------------------------------------------------- docker ----
+# Workers run in a container: repo mounted read-only, only the task's worktree writable,
+# OpenCode login kept in a docker volume (separate from the host's own login).
+
+BASE_IMAGE="orchestra-opencode"
+DATA_VOL="orchestra-opencode-data"
+CACHE_VOL="orchestra-opencode-cache"
+# Native CLI logins, one volume each: <kind>:<volume>:<config dir in the container>.
+CLI_VOLS="claude:orchestra-claude:/home/oc/.claude codex:orchestra-codex:/home/oc/.codex grok:orchestra-grok:/home/oc/.grok agy:orchestra-agy:/home/oc/.gemini"
+cli_vol_flags() { local e; for e in $CLI_VOLS; do printf '%s\n' -v "$(echo "$e" | cut -d: -f2):$(echo "$e" | cut -d: -f3)"; done; }
+
+have_docker() { command -v docker >/dev/null && docker info >/dev/null 2>&1; }
+
+build_base() {
+  local v; v="$("$OPENCODE" --version 2>/dev/null | grep -Eo '[0-9]+(\.[0-9]+)+' | head -1)"
+  echo "[orchestra] building $BASE_IMAGE (opencode ${v:-latest})" >&2
+  docker build -q --build-arg "OPENCODE_VERSION=${v:-latest}" -t "$BASE_IMAGE" "$KIT_DIR/docker" >&2
+}
+
+# Image for this repo: <repo>/.orchestra/Dockerfile (FROM orchestra-opencode) or the base image.
+box_image() {
+  local root="$1" df="$1/.orchestra/Dockerfile" tag
+  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || build_base || die "docker build failed"
+  if [ -f "$df" ]; then
+    tag="orchestra-oc-$(sha_of "$df" | cut -c1-12)"
+    if ! docker image inspect "$tag" >/dev/null 2>&1; then
+      echo "[orchestra] building project image $tag" >&2
+      docker build -q -t "$tag" -f "$df" "$root/.orchestra" >&2 || die "project image build failed"
+    fi
+    echo "$tag"
+  else echo "$BASE_IMAGE"; fi
+}
+
+# in_box <root> <cwd> <writable-dir|""> cmd...   (extra docker flags via BOX_FLAGS array)
+in_box() {
+  local root="$1" cwd="$2" rw="$3"; shift 3
+  have_docker || die "runtime is docker but docker isn't running (start it, or: orchestra models set runtime host)"
+  local img; img="$(box_image "$root")" || exit 1
+  local a=(run --rm -i --init --user "$(id -u):$(id -g)"
+    -v "$root:$root:ro" -w "$cwd"
+    -v "$DATA_VOL:/home/oc/.local/share/opencode"
+    -v "$CACHE_VOL:/home/oc/.cache"
+    -e ORCHESTRA_IN_BOX=1)
+  local f; while IFS= read -r f; do a+=("$f"); done < <(cli_vol_flags)
+  [ -n "$rw" ] && a+=(-v "$rw:$rw")
+  [ -d "$HOME/.config/opencode" ] && a+=(-v "$HOME/.config/opencode:/home/oc/.config/opencode:ro")
+  [ -n "${BOX_FLAGS+x}" ] && a+=("${BOX_FLAGS[@]}")
+  [ -n "${BOX_TTY:-}" ] && a+=(-t -e TERM=xterm-256color)
+  [ -n "${BOX_NAME:-}" ] && a+=(--name "$BOX_NAME")
+  docker "${a[@]}" "$img" "$@"
+}
+
+# run_in <cwd> cmd...  — run a worker-side command (setup, tests) in the configured runtime.
+run_in() {
+  local cwd="$1"; shift
+  if [ "$(runtime)" = docker ]; then
+    local rw=""; case "$cwd" in "$ROOT"/.orchestra/worktrees/*) rw="$cwd" ;; esac
+    in_box "$ROOT" "$cwd" "$rw" "$@"
+  else ( cd "$cwd" && "$@" ); fi
+}
+
+cmd_docker() {
+  local root; if git rev-parse --git-dir >/dev/null 2>&1; then root="$(repo_root)"; else root="$(pwd)"; fi
+  have_docker || die "docker isn't running"
+  case "${1:-}" in
+    build) build_base || die "image build failed"
+      [ -f "$root/.orchestra/Dockerfile" ] && { box_image "$root" >/dev/null || exit 1; }
+      echo "built $BASE_IMAGE" ;;
+    login) shift
+      docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || build_base
+      local kind="${1:-opencode}"; [ $# -gt 0 ] && shift
+      local cmd vols=(-v "$DATA_VOL:/home/oc/.local/share/opencode" -v "$CACHE_VOL:/home/oc/.cache")
+      local f; while IFS= read -r f; do vols+=("$f"); done < <(cli_vol_flags)
+      case "$kind" in
+        opencode) cmd=(opencode auth login "$@") ;;
+        claude)   cmd=(claude auth login "$@") ;;
+        codex)    cmd=(codex login --device-auth "$@") ;;
+        grok)     cmd=(grok login --device-auth "$@") ;;
+        agy)      echo "agy signs in on first start: follow the URL it prints, then type /exit."
+                  cmd=(agy "$@") ;;
+        *) die "usage: orchestra docker login [opencode|claude|codex|grok|agy]" ;;
+      esac
+      echo "Logging $kind in inside the worker container (kept in a docker volume)."
+      docker run --rm -it --network host --user "$(id -u):$(id -g)" -e TERM=xterm-256color \
+        "${vols[@]}" "$BASE_IMAGE" "${cmd[@]}" ;;
+    shell)
+      docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || build_base
+      local vols=(); local f; while IFS= read -r f; do vols+=("$f"); done < <(cli_vol_flags)
+      docker run --rm -it --network host --user "$(id -u):$(id -g)" -e TERM=xterm-256color \
+        -v "$DATA_VOL:/home/oc/.local/share/opencode" -v "$CACHE_VOL:/home/oc/.cache" "${vols[@]}" \
+        -v "$root:$root:ro" -w "$root" "$BASE_IMAGE" bash ;;
+    models) in_box "$root" "$root" "" opencode models ;;
+    reset-login) local v="$DATA_VOL"; case "${2:-}" in claude|codex|grok|agy) v="orchestra-$2" ;; esac
+      docker volume rm "$v" && echo "removed $v (log in again: orchestra docker login ${2:-})" ;;
+    *) die "usage: orchestra docker build | login [kind] | shell | models | reset-login [kind]" ;;
+  esac
+}
+
+# Seconds a worker may run before it is stopped (`timeout` in models.conf, minutes; default 45).
+timeout_secs() { local t="${ORCHESTRA_TIMEOUT:-$(conf_lookup timeout)}"; echo $(( ${t:-45} * 60 )); }
+
+# jq filters over each CLI's streaming JSON: the final reply, and one line per action.
+jq_text() {
+  case "$1" in
+    claude) echo 'select(.type=="result") | .result // empty' ;;
+    codex)  echo 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' ;;
+    grok)   echo 'if .type=="text" then .data elif .type=="tool_call" then "\n" else empty end' ;;
+    agy)    echo 'select(.event=="result") | .result.response // empty' ;;
+    *)      echo 'select(.type=="text") | .part.text' ;;
+  esac
+}
+# Each event becomes "A<tab>line" (an action) or "T<tab>text" (a reply fragment, joined by `pretty`).
+jq_pretty() {
+  case "$1" in
+    claude) echo 'if .type=="assistant" then (.message.content[]? | if .type=="tool_use" then "A\t→ \(.name) \(.input.command // .input.file_path // .input.pattern // .input.description // "")" elif .type=="text" then "T\t\(.text) " else empty end) elif .type=="result" then "A\t✓ \(.subtype // "done")" else empty end' ;;
+    codex)  echo 'if .type=="item.completed" then (.item | if .type=="command_execution" then "A\t→ shell \(.command)" elif .type=="file_change" then "A\t→ edit \([.changes[]?.path] | join(" "))" elif .type=="mcp_tool_call" then "A\t→ \(.server).\(.tool)" elif .type=="web_search" then "A\t→ web_search \(.query // "")" elif .type=="agent_message" then "T\t\(.text) " else empty end) elif .type=="turn.completed" then "A\t✓ done" elif .type=="turn.failed" then "A\t✗ \(.error.message)" elif .type=="error" then "A\t✗ \(.message)" else empty end' ;;
+    grok)   echo 'if .type=="tool_call" then "A\t→ \(.toolName) \(.rawInput.command // .rawInput.path // .rawInput.file_path // .rawInput.target_file // .rawInput.description // "")" elif .type=="text" then "T\t\(.data)" elif .type=="end" then "A\t✓ \(.stopReason)" else empty end' ;;
+    agy)    echo 'if .event=="step_update" and .step_update.state=="DONE" then (.step_update | if .step_type=="tool" then "A\t→ \(.tool_name) \(.tool_info.parameters | (.CommandLine // .AbsolutePath // .TargetFile // .Query // tostring))" elif .text_delta then "T\t\(.text_delta)" else empty end) elif .event=="result" then "A\t✓ \(.result.status)" else empty end' ;;
+    *)      echo 'if .type=="tool_use" then "A\t→ \(.part.tool) \(.part.state.input.command // .part.state.input.filePath // .part.state.input.pattern // "")" elif .type=="text" then "T\t\(.part.text) " elif .type=="error" then "A\t✗ \(.error.message)" else empty end' ;;
+  esac
+}
+# pretty <kind> [dir...]  (stdin: raw stream) -> one short line per action / reply; non-JSON output
+# marked "!". Paths under the given dirs are shown relative to them.
+pretty() {
+  local kind="$1"; shift
+  grep --line-buffered -v "$NOISE_RE" |
+  jq --unbuffered -R -r ". as \$l | (try fromjson catch {\"__raw\": \$l}) | objects
+    | if .__raw then \"A\t! \(.__raw)\" else ($(jq_pretty "$kind")) end | tostring | gsub(\"\\n\"; \" \")" |
+  awk -v w=160 -v p1="${1:-}" -v p2="${2:-}" '
+    function strip(line, p,   i) { if (p == "") return line
+      while ((i = index(line, p "/")) > 0) line = substr(line, 1, i - 1) substr(line, i + length(p) + 1)
+      return line }
+    function out(line) { line = strip(strip(line, p1), p2); gsub(/[ \t]+/, " ", line); sub(/^ /, "", line); if (line != "") print substr(line, 1, w); fflush() }
+    function flush() { if (buf != "") { out("· " buf); buf = "" } }
+    { t = substr($0, 1, 1); rest = substr($0, 3) }
+    t == "T" { buf = buf rest; next }
+    { flush(); out(rest) }
+    END { flush() }'
+}
+# Harmless non-JSON chatter on a CLI's stderr (codex exec notes that it read the empty stdin).
+NOISE_RE='^Reading additional input from stdin\.\.\.$'
+# agent_text <kind> <raw> -> the reply as plain text, then any errors / non-JSON output.
+agent_text() {
+  local f; f="fromjson? | objects | $(jq_text "$1")"
+  if [ "$1" = grok ]; then jq -R -j "$f" "$2"; echo; else jq -R -r "$f" "$2"; fi
+  grep -v "$NOISE_RE" "$2" | jq -R -r '(try fromjson catch null) as $j | if $j == null then .
+    else ($j | objects | select((.type // .event) == "error" or .type == "turn.failed" or .is_error == true)
+      | (.error.message? // .error? // .result? // .message? // tostring) | tostring) end' | strip_ansi
+}
+
+# run_agent <log> <cwd> <model> <agent> <prompt> [file]   -> exit code of the agent CLI (124 = timed out)
+# agent "plan" = read-only. The lead's own CLI runs on the host; everything else in the runtime.
+# The live stream goes to <log>.jsonl (see `orchestra log`), the reply text to <log>.
+run_agent() {
+  local log="$1" cwd="$2" spec agent="$4" prompt="$5" file="${6:-}"
+  spec="$(resolve_model "$3")"
+  local kind m e="" sid=""; kind="$(model_kind "$spec")"
+  m="${spec%%#*}"; [ "$m" != "$spec" ] && e="${spec#*#}"
+  # Only OpenCode takes attachments; the native CLIs read the file themselves.
+  [ -n "$file" ] && [ "$kind" != opencode ] && prompt="$prompt
+
+The attached file is at: $file (read it)."
+  local where=host
+  [ "$(runtime)" = docker ] && [ "$(placement "$3")" != host ] && where=docker
+  local cmd
+  case "$kind" in
+    opencode) cmd=("$OPENCODE" run --standalone --auto -m "$spec" --title orchestra --format json)
+      [ -n "$agent" ] && cmd+=(--agent "$agent")
+      [ -n "$file" ] && cmd+=(-f "$file") ;;
+    claude) sid="$(new_uuid)"
+      cmd=(claude --model "${m#*/}" --output-format stream-json --verbose --session-id "$sid")
+      [ -n "$e" ] && cmd+=(--effort "$e")
+      if [ "$agent" = plan ]; then cmd+=(--permission-mode plan); else cmd+=(--permission-mode bypassPermissions); fi
+      cmd+=(-p) ;;
+    codex) cmd=(codex exec --json -m "${m#*/}")
+      [ -n "$e" ] && cmd+=(-c "model_reasoning_effort=\"$e\"")
+      # The container is the sandbox (Codex's own can't nest in it); on the host use Codex's sandbox,
+      # with network on so installs and tests work.
+      if [ "$where" = docker ]; then cmd+=(--dangerously-bypass-approvals-and-sandbox)
+      elif [ "$agent" = plan ]; then cmd+=(-s read-only)
+      else cmd+=(-s workspace-write -c sandbox_workspace_write.network_access=true); fi
+      cmd+=(-C "$cwd") ;;
+    grok) sid="$(new_uuid)"
+      cmd=(grok -m "${m#*/}" --output-format streaming-json -s "$sid")
+      [ -n "$e" ] && cmd+=(--reasoning-effort "$e")
+      if [ "$agent" = plan ]; then cmd+=(--permission-mode plan); else cmd+=(--always-approve); fi
+      cmd+=(-p) ;;
+    agy) cmd=(agy --model "${m#*/}" --output-format stream-json)
+      [ -n "$e" ] && cmd+=(--effort "$e")
+      # Headless agy denies every unapproved tool, reads included; plan mode still blocks writes.
+      [ "$agent" = plan ] && cmd+=(--mode plan)
+      cmd+=(--dangerously-skip-permissions)
+      cmd+=(-p) ;;
+  esac
+  cmd+=("$prompt")
+
+  local rd raw="${log%.log}.jsonl"
+  rd="$(dirname "$log")"
+  local cname; cname="orch-$(basename "$rd" | tr -c 'A-Za-z0-9_.-' '-')-$(basename "$log" .log | tr -c 'A-Za-z0-9_.-' '-')$$"
+  printf 'kind=%s\nmodel=%s\nraw=%s\npid=%s\nstarted=%s\ncwd=%s\n' "$kind" "$3" "$raw" "$$" "$(date +%s)" "$cwd" >"$rd/current"
+  if [ "$where" = docker ]; then
+    # Attachments outside the repo aren't visible in the container; diff.patch lives in .orchestra.
+    local rw=""; [ "$agent" != plan ] && case "$cwd" in "$ROOT"/.orchestra/worktrees/*) rw="$cwd" ;; esac
+    cmd[0]="$(basename "${cmd[0]}")"
+    BOX_NAME="$cname" in_box "$ROOT" "$cwd" "$rw" "${cmd[@]}" </dev/null >"$raw" 2>&1 &
+  else
+    ( cd "$cwd" && exec "${cmd[@]}" ) </dev/null >"$raw" 2>&1 &
+  fi
+  local pid=$! secs waited=0 rc timed_out=""
+  secs="$(timeout_secs)"
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      timed_out=1; echo "    timed out after $((secs / 60))m, stopping it" >&2
+      [ "$where" = docker ] && docker kill "$cname" >/dev/null 2>&1
+      kill "$pid" 2>/dev/null; break
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  [ -n "$timed_out" ] && rc=124
+
+  # Session id, so `orchestra attach` can reopen the conversation interactively.
+  [ -z "$sid" ] && sid="$(jq -R -r 'fromjson? | objects | (.conversation_id // .sessionID // .thread_id // empty)' "$raw" 2>/dev/null | head -1)"
+  printf '%s %s %s %s %s %s\n' "$(basename "$log" .log)" "$kind" "$where" "${sid:--}" "$3" "$cwd" >>"$rd/sessions"
+  agent_text "$kind" "$raw" >"$log"
+  [ -n "$timed_out" ] && echo "TIMED OUT after $((secs / 60))m" >>"$log"
+  rm -f "$rd/current"
+  return "$rc"
+}
+
+# Try each model of a role until one runs. Sets USED_MODEL. Returns last exit code.
+# run_role <role|model:X> <logprefix> <cwd> <agent> <prompt> [file] [changed-check-dir]
+run_role() {
+  local spec="$1" logp="$2" cwd="$3" agent="$4" prompt="$5" file="${6:-}" wt="${7:-}"
+  local models m rc=1 n=0
+  case "$spec" in model:*) models="${spec#model:}" ;; *) models="$(role_models "$spec")" ;; esac
+  USED_MODEL=""; ALL_FAILED=""
+  for m in $models; do
+    n=$((n + 1))
+    [ "$(placement "$m")" = subagent ] && { echo "  → $m skipped (only the lead can spawn it, as its own subagent)" >&2; continue; }
+    local log="$logp.$n.log"
+    echo "  → $m [$(placement "$m")]" >&2
+    run_agent "$log" "$cwd" "$m" "$agent" "$prompt" "$file"; rc=$?
+    USED_MODEL="$m"; LAST_LOG="$log"
+    local changed=""
+    [ -n "$wt" ] && changed="$(git -C "$wt" status --porcelain 2>/dev/null)"
+    local unavailable=""
+    [ $rc -ne 0 ] && unavailable=1
+    # Short output mentioning a provider/limit error also counts, even with exit 0.
+    grep -Eqi "$FALLBACK_RE" "$log" && [ "$(wc -l <"$log")" -lt 40 ] && unavailable=1
+    if [ -z "$changed" ] && [ -n "$unavailable" ]; then
+      echo "    unavailable/failed (exit $rc), trying next model" >&2
+      continue
+    fi
+    return $rc
+  done
+  ALL_FAILED=1
+  return $rc
+}
+
+# After run_role in read-only commands: stop if no model could run.
+require_ran() {
+  [ -z "${ALL_FAILED:-}" ] && return 0
+  echo "orchestra: no model in the list could run. Last output:" >&2
+  tail -n 8 "$LAST_LOG" >&2
+  echo "fix: orchestra models doctor / orchestra models set <role> ..." >&2
+  exit 1
+}
+
+# Print text after the last "<MARKER>:" line, else the tail.
+extract() { # extract <file> <marker> <maxlines>
+  awk -v mk="$2" '
+    { line[NR] = $0 }
+    { s = $0; gsub(/[*#`_ ]/, "", s); if (index(toupper(s), toupper(mk) ":") == 1) at = NR }
+    END {
+      if (at) { rest = line[at]; sub(/^[^:]*:[ \t]*/, "", rest); if (rest != "") print rest
+                for (i = at + 1; i <= NR; i++) print line[i] }
+      else for (i = (NR > 15 ? NR - 14 : 1); i <= NR; i++) print line[i]
+    }' "$1" | sed '/^[[:space:]]*$/d' | head -n "$3"
+}
+
+# Task file: optional "key: value" header lines (role, test, name) then "---", then body.
+task_header() { awk -v k="$2" 'NR==1 && !/^[a-z]+:/ {exit} /^---[ \t]*$/ {exit}
+  { split($0, a, ":"); if (a[1] == k) { v = substr($0, index($0, ":") + 1); sub(/^[ \t]+/, "", v); print v; exit } }' "$1"; }
+task_body() { if grep -qx -- '---' "$1" && head -1 "$1" | grep -Eq '^[a-z]+:'; then
+  awk 'f {print} /^---[ \t]*$/ && !f {f=1}' "$1"; else cat "$1"; fi; }
+
+meta_get() { [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | tail -1; }
+
+# --------------------------------------------------------------- delegate ----
+
+cmd_delegate() {
+  local task="" role="" model="" test="" name="" base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --role) role="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --test) test="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      -*) die "unknown flag $1" ;;
+      *) task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] && [ -f "$task" ] || die "usage: orchestra delegate <task.md> [--role R|--model M] [--test CMD] [--name slug] [--base ref]"
+
+  local root sd
+  root="$(repo_root)"; sd="$(state_dir)"; ROOT="$root"
+  [ -z "$role" ] && role="$(task_header "$task" role)"; [ -z "$role" ] && role="build"
+  [ -z "$test" ] && test="$(task_header "$task" test)"
+  [ -z "$name" ] && name="$(task_header "$task" name)"
+  [ -z "$name" ] && name="$(basename "$task" .md)"
+  name="$(echo "$name" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-//; s/-$//')"
+  # Branch from the caller's HEAD (its worktree branch), not the main checkout's.
+  [ -z "$base" ] && base="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$base" = "HEAD" ] && base="$(git rev-parse HEAD)"
+  local base_sha; base_sha="$(git rev-parse --verify --quiet "$base^{commit}")" || die "bad --base '$base'"
+
+  local wt="$sd/worktrees/$name" br="orch/$name" rd="$sd/runs/$name"
+  mkdir -p "$rd"
+  cp "$task" "$rd/task.md" 2>/dev/null || true
+  if [ ! -d "$wt" ]; then
+    if git -C "$root" show-ref --verify --quiet "refs/heads/$br"; then
+      git -C "$root" worktree add -q "$wt" "$br" || die "worktree add failed"
+    else
+      git -C "$root" worktree add -q -b "$br" "$wt" "$base_sha" || die "worktree add failed"
+    fi
+    # Per-project setup for fresh worktrees (install deps, copy .env, ...).
+    if [ -x "$root/.orchestra/setup.sh" ]; then
+      run_in "$wt" "$root/.orchestra/setup.sh" "$root" >"$rd/setup.log" 2>&1 </dev/null \
+        || echo "  warning: setup.sh failed (see $rd/setup.log)" >&2
+    fi
+  fi
+
+  local spec="$role"; [ -n "$model" ] && spec="model:$model"
+  local body; body="$(task_body "$task")"
+  local verify=""
+  [ -n "$test" ] && verify="- Verification command: \`$test\` — run it and make it pass before finishing."
+  local prompt
+  prompt="You are an implementation agent working inside a dedicated git worktree: $wt
+Only modify files inside that directory.
+
+TASK:
+$body
+
+RULES:
+- Make the smallest correct change. Follow the existing code style and conventions.
+- Do NOT git commit, push, switch branches, or edit files outside the worktree.
+$verify
+- When finished, end your reply with a line \"SUMMARY:\" followed by at most 10 short lines:
+  what changed, anything left undone, risks or assumptions."
+
+  local start rc attempts=1 status="DONE" testres="none" used log
+  start=$(date +%s)
+  local usable; usable="$(usable_models "$spec")"
+  [ -n "$usable" ] || die "no model in '$spec' is usable with lead '$(lead_agent)' (see: orchestra models doctor)"
+
+  status="RUNNING"; write_meta; status="DONE"
+
+  # Run models in order until the first one native to the lead; that one (as a first choice or
+  # as the fallback after the others failed) runs as the lead's own subagent, which then calls
+  # `orchestra finish`.
+  local before="" handoff="" m
+  for m in $usable; do
+    [ "$(placement "$m")" = subagent ] && { handoff="$m"; break; }
+    before="$before $m"
+  done
+  if [ -n "$before" ]; then
+    echo "[orchestra] delegating '$name' (role $spec) on $br" >&2
+    run_role "model:${before# }" "$rd/attempt-1" "$wt" "" "$prompt" "" "$wt"; rc=$?
+    used="$USED_MODEL"; log="$LAST_LOG"
+  fi
+  if [ -n "$handoff" ] && { [ -z "$before" ] || { [ -n "${ALL_FAILED:-}" ] && [ -z "$(git -C "$wt" status --porcelain)" ]; }; }; then
+    [ -n "$before" ] && echo "  → $handoff [subagent]" >&2
+    local cm="${handoff#*/}" ce=default; [ "${cm#*#}" != "$cm" ] && ce="${cm#*#}"
+    printf '%s\n' "$prompt" >"$rd/prompt.md"
+    : >"$rd/agent.md"
+    used="$handoff"; status="PENDING"; attempts=0
+    write_meta
+    echo "NATIVE_DELEGATE kind=$(model_kind "$handoff") model=${cm%%#*} effort=$ce"
+    echo "  cwd:    $wt"
+    echo "  prompt: $rd/prompt.md"
+    echo "  save:   $rd/agent.md"
+    echo "  then:   orchestra finish $name"
+    echo "Spawn a subagent with that model/effort, working directory cwd: give it the prompt, save its"
+    echo "final reply to the save path, then run the 'then' command (tests, commit, summary)."
+    return 0
+  fi
+
+  if [ $rc -ne 0 ] && [ -z "$(git -C "$wt" status --porcelain)" ]; then
+    status="AGENT_FAILED"
+  elif [ -n "$test" ]; then
+    if run_in "$wt" bash -c "$test" >"$rd/test-1.log" 2>&1 </dev/null; then testres="PASS"
+    else
+      testres="FAIL"; attempts=2
+      echo "  tests failed, one fix attempt with $used" >&2
+      local fixp
+      fixp="$prompt
+
+PREVIOUS ATTEMPT FAILED VERIFICATION. The worktree already contains your earlier changes.
+Output of \`$test\` (last 80 lines):
+$(tail -80 "$rd/test-1.log")
+
+Fix the problem, re-run the verification, then reply with SUMMARY: as before."
+      run_agent "$rd/attempt-2.log" "$wt" "$used" "" "$fixp"; log="$rd/attempt-2.log"
+      if run_in "$wt" bash -c "$test" >"$rd/test-2.log" 2>&1 </dev/null; then testres="PASS"; fi
+    fi
+    [ "$testres" = "FAIL" ] && status="TEST_FAILED"
+  fi
+  [ "${rc:-0}" -eq 124 ] && [ "$testres" != "PASS" ] && status="TIMEOUT"
+  finalize_run
+}
+
+# Uses the caller's locals: name role used base base_sha br wt status test testres attempts start body rd root log
+write_meta() {
+  cat >"$rd/meta" <<EOF
+name=$name
+role=$role
+model=$used
+base=$base
+base_sha=$base_sha
+branch=$br
+worktree=$wt
+status=$status
+test=$test
+test_result=$testres
+attempts=$attempts
+runtime=$(runtime)
+started=$start
+seconds=$(( $(date +%s) - start ))
+EOF
+}
+
+# Commit the agent's work on the task branch so the lead can diff/merge it, then print the summary.
+finalize_run() {
+  local changed=""
+  if [ -n "$(git -C "$wt" status --porcelain)" ]; then
+    git -C "$wt" add -A
+    git -C "$wt" commit -q --no-verify -m "orch($name): $(head -c 60 <<<"$(echo "$body" | sed '/^[[:space:]]*$/d' | head -1)")" -m "model: $used" && changed=1
+  fi
+  [ -z "$changed" ] && [ "$(git -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)" = "0" ] \
+    && [ "$status" = "DONE" ] && status="NO_CHANGES"
+
+  local secs=$(( $(date +%s) - start ))
+  write_meta
+
+  local headline="$status"; [ "$testres" != "none" ] && headline="$status test=$testres"
+  echo "[orchestra] $name: $headline  model=$used  attempts=$attempts  ${secs}s  [$(runtime)]"
+  echo "branch: $br (base $base)   worktree: ${wt#$root/}"
+  git -C "$wt" diff --stat "$base...HEAD" 2>/dev/null | tail -n 12 | sed 's/^/  /'
+  echo "summary:"
+  extract "$log" SUMMARY 12 | sed 's/^/  /'
+  if [ "$testres" = "FAIL" ]; then
+    echo "test output (tail):"; tail -n 15 "$rd/test-$attempts.log" | sed 's/^/  /'
+  fi
+  echo "logs: ${rd#$root/}/"
+  case "$status" in DONE|NO_CHANGES) return 0 ;; *) return 1 ;; esac
+}
+
+# Finish a task the lead's own subagent implemented (see NATIVE_DELEGATE): test, commit, summarize.
+cmd_finish() {
+  [ $# -ge 1 ] || die "usage: orchestra finish <task-name>"
+  local root sd rd; root="$(repo_root)"; sd="$(state_dir)"; ROOT="$root"
+  rd="$sd/runs/$1"; [ -f "$rd/meta" ] || die "no run named '$1'"
+  local name role used base base_sha br wt test start body status=DONE testres=none attempts log
+  name="$(meta_get "$rd/meta" name)"; role="$(meta_get "$rd/meta" role)"
+  used="$(meta_get "$rd/meta" model)"; base="$(meta_get "$rd/meta" base)"
+  base_sha="$(meta_get "$rd/meta" base_sha)"; br="$(meta_get "$rd/meta" branch)"
+  wt="$(meta_get "$rd/meta" worktree)"; test="$(meta_get "$rd/meta" test)"
+  start="$(meta_get "$rd/meta" started)"; [ -n "$start" ] || start=$(date +%s)
+  [ -f "$rd/prompt.md" ] || die "run '$1' was not handed to the lead's subagent"
+  attempts=$(( $(meta_get "$rd/meta" attempts) + 1 ))
+  body="$(task_body "$rd/task.md")"; log="$rd/agent.md"; [ -f "$log" ] || : >"$log"
+  if [ -n "$test" ]; then
+    if run_in "$wt" bash -c "$test" >"$rd/test-$attempts.log" 2>&1 </dev/null; then testres="PASS"
+    else testres="FAIL"; status="TEST_FAILED"; fi
+  fi
+  finalize_run
+}
+
+# ----------------------------------------------------------------- review ----
+
+cmd_review() {
+  local target="" model="" author="" base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) model="$2"; shift 2 ;;
+      --author) author="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      -*) [ "$1" = "--working" ] && { target="--working"; shift; } || die "unknown flag $1" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die "usage: orchestra review <task-name> | --working [--base ref] [--model M] [--author M]"
+
+  local root sd cwd rd
+  root="$(repo_root)"; sd="$(state_dir)"; ROOT="$root"
+  if [ "$target" = "--working" ]; then
+    # Diff the caller's checkout (may be a linked worktree), not the main checkout.
+    rd="$sd/runs/_working"; mkdir -p "$rd"; cwd="$(work_root)"
+    mount_if_outside "$root" "$cwd"
+    [ -z "$author" ] && author="claude"
+    git -C "$cwd" add -N . 2>/dev/null
+    git -C "$cwd" diff "${base:-HEAD}" >"$rd/diff.patch"
+  else
+    rd="$sd/runs/$target"; [ -f "$rd/meta" ] || die "no run named '$target'"
+    cwd="$(meta_get "$rd/meta" worktree)"; [ -d "$cwd" ] || cwd="$root"
+    [ -z "$author" ] && author="$(meta_get "$rd/meta" model)"
+    [ -z "$base" ] && base="$(meta_get "$rd/meta" base)"
+    git -C "$root" diff "$base...$(meta_get "$rd/meta" branch)" >"$rd/diff.patch"
+  fi
+  [ -s "$rd/diff.patch" ] || die "nothing to review (empty diff)"
+
+  # Reviewer must differ from the author.
+  local cand="" m
+  if [ -n "$model" ]; then cand="$model"
+  else for m in $(usable_models review); do [ "${m%%#*}" != "${author%%#*}" ] && cand="$cand $m"; done; fi
+  [ -n "$cand" ] || die "no usable review model differs from the author ($author) with lead '$(lead_agent)'; add another to the review role"
+
+  local prompt="You are a senior code reviewer. The attached diff.patch is the change under review; the repository is your working directory, so read surrounding code when needed. Do NOT modify any files.
+Look for: correctness bugs, edge cases, security issues, broken contracts or callers, missing tests. Ignore style nits.
+End with a line \"FINDINGS:\" then at most 15 lines, most severe first, each formatted:
+- [high|med|low] path:line — problem — suggested fix
+If there are no real problems, write \"FINDINGS:\" then \"- none\"."
+
+  # Reviewers native to the lead run as its own subagent.
+  local first; first="$(echo $cand | awk '{print $1}')"
+  if [ "$(placement "$first")" = subagent ]; then
+    local cm="${first#*/}"
+    printf '%s\n' "$prompt" >"$rd/review-prompt.md"
+    local ce=default; [ "${cm#*#}" != "$cm" ] && ce="${cm#*#}"
+    echo "NATIVE_REVIEW kind=$(model_kind "$first") model=${cm%%#*} effort=$ce"
+    echo "  diff:   $rd/diff.patch ($(grep -c '^' "$rd/diff.patch") lines)"
+    echo "  cwd:    $cwd"
+    echo "  prompt: $rd/review-prompt.md"
+    echo "  save:   $rd/review.md"
+    echo "Spawn a subagent with that model/effort, working directory cwd: give it the prompt and diff,"
+    echo "save its reply to the save path, then report its FINDINGS."
+    return 0
+  fi
+  echo "[orchestra] reviewing $target (author $author)" >&2
+  run_role "model:$cand" "$rd/review" "$cwd" plan "$prompt" "$rd/diff.patch"; require_ran
+  cp "$LAST_LOG" "$rd/review.md" 2>/dev/null
+  echo "[orchestra] review of $target by $USED_MODEL ($(grep -c '^' "$rd/diff.patch") diff lines)"
+  extract "$rd/review.md" FINDINGS 16
+  echo "full review: ${rd#$root/}/review.md"
+}
+
+# -------------------------------------------------------------------- ask ----
+
+cmd_ask() {
+  [ $# -ge 2 ] || die "usage: orchestra ask <role|provider/model> \"question\" [-f file]"
+  local spec="$1" q="$2" file=""; shift 2
+  [ "${1:-}" = "-f" ] && file="$2"
+  case "$spec" in */*) spec="model:$spec" ;; esac
+  local cwd sd rd
+  cwd="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; ROOT="$cwd"
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then sd="$(state_dir)"; else sd="${TMPDIR:-/tmp}/orchestra"; fi
+  rd="$sd/runs/_ask"; mkdir -p "$rd"
+  local id; id="$(date +%Y%m%d-%H%M%S)"
+  local prompt="$q
+
+Do not modify any files. Be concise and concrete (file paths, line numbers). End with \"ANSWER:\" followed by your conclusion in at most $MAX_LINES lines."
+  run_role "$spec" "$rd/$id" "$cwd" plan "$prompt" "$file"; require_ran
+  echo "[orchestra] answer from $USED_MODEL"
+  extract "$LAST_LOG" ANSWER "$MAX_LINES"
+  echo "full answer: $LAST_LOG"
+}
+
+# ------------------------------------------------------------ status/clean ----
+
+cmd_status() {
+  local sd d now; sd="$(state_dir)"; now=$(date +%s)
+  printf '%-22s %-12s %-6s %-28s %s\n' TASK STATUS TEST MODEL "BRANCH | NOW"
+  for d in "$sd"/runs/*/; do
+    [ -f "$d/meta" ] || continue
+    local st model extra
+    st="$(meta_get "$d/meta" status)"; model="$(meta_get "$d/meta" model)"; extra="$(meta_get "$d/meta" branch)"
+    if [ -f "$d/current" ]; then
+      if kill -0 "$(meta_get "$d/current" pid)" 2>/dev/null; then
+        st=RUNNING; model="$(meta_get "$d/current" model)"
+        extra="$(( (now - $(meta_get "$d/current" started)) / 60 ))m | $(pretty "$(meta_get "$d/current" kind)" "$(meta_get "$d/current" cwd)" "$(repo_root)" <"$(meta_get "$d/current" raw)" | tail -1 | cut -c1-90)"
+      else st=DIED; fi
+    elif [ "$st" = RUNNING ]; then st=DIED
+    fi
+    printf '%-22s %-12s %-6s %-28s %s\n' "$(meta_get "$d/meta" name)" "$st" \
+      "$(meta_get "$d/meta" test_result)" "$model" "$extra"
+  done
+}
+
+# Follow what a worker is doing: one line per tool call / message.
+cmd_log() {
+  local follow=""; [ "${1:-}" = -f ] && { follow=1; shift; }
+  [ $# -ge 1 ] || die "usage: orchestra log [-f] <task-name>"
+  local rd; rd="$(state_dir)/runs/$1"; [ -d "$rd" ] || die "no run named '$1'"
+  local kind raw cwd
+  if [ -f "$rd/current" ]; then
+    kind="$(meta_get "$rd/current" kind)"; raw="$(meta_get "$rd/current" raw)"; cwd="$(meta_get "$rd/current" cwd)"
+  else
+    raw="$(ls -t "$rd"/*.jsonl 2>/dev/null | head -1)"; [ -n "$raw" ] || die "no worker output for '$1' yet"
+    local _ sid m
+    read -r _ kind _ sid m cwd <<<"$(awk -v a="$(basename "$raw" .jsonl)" '$1 == a' "$rd/sessions" 2>/dev/null | tail -1)"
+  fi
+  echo "[$1] $(basename "$raw") (${kind:-?})" >&2
+  if [ -n "$follow" ]; then tail -n +1 -f "$raw" | pretty "$kind" "$cwd" "$(repo_root)"
+  else pretty "$kind" "$cwd" "$(repo_root)" <"$raw" | tail -n "${ORCHESTRA_LOG_LINES:-40}"; fi
+}
+
+# Reopen a worker's last session interactively (same model, same worktree, same runtime).
+cmd_attach() {
+  [ $# -ge 1 ] || die "usage: orchestra attach <task-name | _ask | _working>"
+  local root rd; root="$(repo_root)"; ROOT="$root"; rd="$(state_dir)/runs/$1"
+  [ -f "$rd/sessions" ] || die "no recorded worker session for '$1'"
+  local _ kind where sid model cwd
+  read -r _ kind where sid model cwd <<<"$(tail -1 "$rd/sessions")"
+  [ "$sid" != "-" ] || die "the last run of '$1' ($model) didn't report a session id"
+  local cmd
+  case "$kind" in
+    claude) cmd=(claude --resume "$sid") ;;
+    codex)  cmd=(codex resume "$sid"); [ "$where" = docker ] && cmd+=(--dangerously-bypass-approvals-and-sandbox) ;;
+    grok)   cmd=(grok --resume "$sid") ;;
+    agy)    cmd=(agy --conversation "$sid") ;;
+    *)      cmd=(opencode --session "$sid"); [ "$where" = host ] && cmd[0]="$OPENCODE" ;;
+  esac
+  echo "Resuming $model ($kind) session $sid in ${cwd#$root/} [$where]. Quit the agent to come back." >&2
+  if [ "$where" = docker ]; then
+    local rw=""; case "$cwd" in "$root"/.orchestra/worktrees/*) rw="$cwd" ;; esac
+    BOX_TTY=1 in_box "$root" "$cwd" "$rw" "${cmd[@]}"
+  else ( cd "$cwd" && exec "${cmd[@]}" ); fi
+}
+
+cmd_clean() {
+  local del="" names="" root sd n
+  root="$(repo_root)"; sd="$(state_dir)"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete-branch) del=1 ;;
+      --all) names="$(ls "$sd/worktrees" 2>/dev/null)" ;;
+      *) names="$names $1" ;;
+    esac; shift
+  done
+  [ -n "$names" ] || die "usage: orchestra clean <task-name>... | --all [--delete-branch]"
+  for n in $names; do
+    git -C "$root" worktree remove --force "$sd/worktrees/$n" 2>/dev/null && echo "removed worktree $n"
+    [ -n "$del" ] && git -C "$root" branch -D "orch/$n" >/dev/null 2>&1 && echo "deleted branch orch/$n"
+  done
+  git -C "$root" worktree prune
+}
+
+usage() {
+  cat <<EOF
+orchestra $VERSION — delegate work from your coding agent to other models
+
+  orchestra delegate <task.md> [--role R | --model M] [--test CMD] [--name slug] [--base ref]
+      Run a task in its own worktree/branch (orch/<slug>), test it, commit, print a short summary.
+      The branch starts from your current HEAD (also in a linked worktree) unless --base is given.
+  orchestra finish <task-name>
+      After a NATIVE_DELEGATE run: test, commit and summarize what the lead's subagent changed.
+  orchestra review <task-name> | --working   [--base ref] [--model M]
+      Cross-review a delegated branch (or your uncommitted changes) with a model other than the author.
+  orchestra ask <role|provider/model> "question" [-f file]
+      Read-only question about the current repo (research / big-context reads).
+  orchestra models [list | get <role> | doctor] [--harness <name>]
+  orchestra models set [--project | --harness [name]] <role> <m1,m2>
+      --harness alone = the current lead's harness file; with list/get/doctor, view another harness.
+  orchestra docker [build | login [opencode|claude|codex|grok|agy] | shell | models | reset-login [kind]]
+      Container runtime for workers (enable: orchestra models set runtime docker).
+  orchestra status
+      Every task's state; running ones show elapsed minutes and their latest action.
+  orchestra log [-f] <task-name>
+      What a worker did (or is doing, with -f): one line per tool call / message.
+  orchestra attach <task-name>
+      Reopen the worker's session interactively (same model, worktree and runtime) to steer or inspect it.
+  orchestra clean <task-name>... | --all [--delete-branch]
+
+Config (first match wins): <repo>/.orchestra/models.conf, then $HARNESS_DIR/<lead>.conf,
+  then $GLOBAL_CONF.  Lead: $(lead_agent)  (detected from the harness env; override ORCHESTRA_LEAD=$(echo $HARNESSES | tr ' ' '|'))
+Worktree setup hook: <repo>/.orchestra/setup.sh (run in each new worktree, e.g. npm ci)
+Runtime: $(runtime)   (host | docker; set with: orchestra models set runtime docker)
+Timeout: $(( $(timeout_secs) / 60 ))m per worker run  (set with: orchestra models set timeout <minutes>)
+EOF
+}
+
+# Sourced (tests): define the functions, skip the dispatch.
+(return 0 2>/dev/null) && return 0
+
+case "${1:-}" in
+  delegate) shift; cmd_delegate "$@" ;;
+  finish)   shift; cmd_finish "$@" ;;
+  review)   shift; cmd_review "$@" ;;
+  ask)      shift; cmd_ask "$@" ;;
+  models)   shift; cmd_models "$@" ;;
+  status)   shift; cmd_status ;;
+  log)      shift; cmd_log "$@" ;;
+  attach)   shift; cmd_attach "$@" ;;
+  docker)   shift; cmd_docker "$@" ;;
+  clean)    shift; cmd_clean "$@" ;;
+  -v|--version) echo "$VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command '$1' (see orchestra --help)" ;;
+esac

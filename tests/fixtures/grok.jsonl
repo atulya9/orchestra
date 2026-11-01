@@ -1,0 +1,4 @@
+{"type":"tool_call","toolName":"run_terminal_command","rawInput":{"command":"npm test"}}
+{"type":"text","data":"All "}
+{"type":"text","data":"good.\nSUMMARY:\n- fixed it"}
+{"type":"end","stopReason":"end_turn","sessionId":"a728f2f4-80aa-4caf-b93a-086162b7bb05"}
