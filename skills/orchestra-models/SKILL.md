@@ -22,8 +22,10 @@ opencode models                                        # OpenCode models (agy mo
 - `lead.*` roles are for the lead agent's own subagents, in that agent's model names plus effort,
   e.g. `lead.explore = haiku#max` for Claude Code. They belong in the harness file (`--harness`), so each
   lead agent keeps its own.
-- Native first: a model of the lead's own kind runs as the lead's subagent (Claude Code) or as the
-  lead's CLI on the host (Codex, Grok, agy, OpenCode); others run in the runtime. Lead is detected from
+- Native first: leads with native subagents (Claude Code, agy, Codex) hand off their own models — plus
+  any cross-CLI models mapped via `native.<kind>/<model> = <name>` in `harness/<lead>.conf` — as native
+  subagents (`subagent = on|off` or `native.<kind>/<model> = off` overrides this); other leads (Grok,
+  OpenCode) use their CLI on the host; everything else runs in the runtime. Lead is detected from
   the harness env; override with `ORCHESTRA_LEAD=claude|codex|grok|agy|opencode|other`.
 - After changing anything, run `orchestra models doctor` and report the result.
 - If a model the user names isn't listed by its CLI, say so and suggest the closest one listed.
