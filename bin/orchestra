@@ -126,17 +126,42 @@ lead_agent() {
 
 # Native CLIs orchestra drives directly (kind/model#effort); anything else is an OpenCode model.
 NATIVE_KINDS="claude codex grok agy"
+# Leads that can spawn native subagents directly (override per harness with `subagent = on|off`).
+SUBAGENT_LEADS="claude agy codex"
 model_kind() { local k="${1%%/*}"; case " $NATIVE_KINDS " in *" $k "*) echo "$k" ;; *) echo opencode ;; esac; }
 
+# Native subagent model name for <spec> under the current lead, or return 1 if not native.
+# Matches (only when the lead is subagent-capable and `subagent` is not off):
+#   1. Explicit mapping in config: native.<kind>/<model> = <subagent-model> (or "off" to force CLI)
+#   2. Same-harness model (<lead>/<model>).
+native_model() {
+  local m="${1%%#*}" mapped k l sa
+  l="$(lead_agent)"
+  sa="$(conf_lookup subagent)"
+  case "$sa" in
+    off|false|no|0) return 1 ;;
+    on|true|yes|1) ;;
+    *) case " $SUBAGENT_LEADS " in *" $l "*) ;; *) return 1 ;; esac ;;
+  esac
+  mapped="$(conf_lookup "native.$m")"
+  if [ -n "$mapped" ]; then
+    case "$mapped" in off|false|no|0) return 1 ;; esac
+    echo "$mapped"; return 0
+  fi
+  k="$(model_kind "$1")"
+  [ "$k" = "$l" ] || return 1
+  if [ "$k" = opencode ]; then echo "$m"
+  else case "$m" in */*) echo "${m#*/}" ;; *) echo "$m" ;; esac; fi
+}
+
 # Where a model runs under the current lead (native first):
-#   subagent  the lead spawns it itself (Claude Code's Agent tool takes model + effort)
+#   subagent  the lead spawns it itself (NATIVE_DELEGATE / NATIVE_REVIEW)
 #   host      the lead's own CLI, headless on this machine with its own login
 #   runtime   the configured runtime (docker container, or host)
 placement() {
-  local k; k="$(model_kind "$1")"
-  if [ "$k" != "$(lead_agent)" ]; then echo runtime
-  elif [ "$k" = claude ]; then echo subagent
-  else echo host; fi
+  if native_model "$1" >/dev/null; then echo subagent
+  elif [ "$(model_kind "$1")" = "$(lead_agent)" ]; then echo host
+  else echo runtime; fi
 }
 
 # Models of a role (or "model:a b"), one per line.
@@ -198,7 +223,7 @@ cmd_models() {
       echo "  runtime         $(runtime)"
       echo "  lead agent      $(lead_agent)"
       for r in $(all_roles); do
-        [ "$r" = runtime ] && continue
+        case "$r" in runtime|subagent|native.*) continue ;; esac
         [ -z "$(conf_lookup "$r")" ] && { printf '  %-15s %s\n' "$r" "(empty)"; continue; }
         local src=""; [ "$(conf_source "$r")" != global ] && src="  [$(conf_source "$r")]"
         printf '  %-15s %s%s\n' "$r" "$(role_models "$r" | paste -sd, - | sed 's/,/, /g')" "$src"
@@ -224,7 +249,7 @@ cmd_models() {
     doctor)
       local avail="" r m bad=0 where workers=0
       for r in $(all_roles); do
-        case "$r" in lead.*|claude.*|runtime|timeout) continue ;; esac
+        case "$r" in lead.*|claude.*|native.*|subagent|runtime|timeout) continue ;; esac
         [ -z "$(conf_lookup "$r")" ] && { echo "  empty   $r (no models configured)"; continue; }
         workers=$((workers + 1))
         for m in $(role_models "$r"); do
@@ -557,7 +582,7 @@ run_role() {
 require_ran() {
   [ -z "${ALL_FAILED:-}" ] && return 0
   echo "orchestra: no model in the list could run. Last output:" >&2
-  tail -n 8 "$LAST_LOG" >&2
+  [ -n "${LAST_LOG:-}" ] && [ -f "$LAST_LOG" ] && tail -n 8 "$LAST_LOG" >&2
   echo "fix: orchestra models doctor / orchestra models set <role> ..." >&2
   exit 1
 }
@@ -667,12 +692,13 @@ $verify
   fi
   if [ -n "$handoff" ] && { [ -z "$before" ] || { [ -n "${ALL_FAILED:-}" ] && [ -z "$(git -C "$wt" status --porcelain)" ]; }; }; then
     [ -n "$before" ] && echo "  → $handoff [subagent]" >&2
-    local cm="${handoff#*/}" ce=default; [ "${cm#*#}" != "$cm" ] && ce="${cm#*#}"
+    local nm ce=default; nm="$(native_model "$handoff")"
+    [ "${handoff#*#}" != "$handoff" ] && ce="${handoff#*#}"
     printf '%s\n' "$prompt" >"$rd/prompt.md"
     : >"$rd/agent.md"
     used="$handoff"; status="PENDING"; attempts=0
     write_meta
-    echo "NATIVE_DELEGATE kind=$(model_kind "$handoff") model=${cm%%#*} effort=$ce"
+    echo "NATIVE_DELEGATE kind=$(lead_agent) model=$nm effort=$ce"
     echo "  cwd:    $wt"
     echo "  prompt: $rd/prompt.md"
     echo "  save:   $rd/agent.md"
@@ -794,7 +820,7 @@ cmd_review() {
     # Diff the caller's checkout (may be a linked worktree), not the main checkout.
     rd="$sd/runs/_working"; mkdir -p "$rd"; cwd="$(work_root)"
     mount_if_outside "$root" "$cwd"
-    [ -z "$author" ] && author="claude"
+    [ -z "$author" ] && author="$(lead_agent)"
     git -C "$cwd" add -N . 2>/dev/null
     git -C "$cwd" diff "${base:-HEAD}" >"$rd/diff.patch"
   else
@@ -818,13 +844,30 @@ End with a line \"FINDINGS:\" then at most 15 lines, most severe first, each for
 - [high|med|low] path:line — problem — suggested fix
 If there are no real problems, write \"FINDINGS:\" then \"- none\"."
 
-  # Reviewers native to the lead run as its own subagent.
-  local first; first="$(echo $cand | awk '{print $1}')"
-  if [ "$(placement "$first")" = subagent ]; then
-    local cm="${first#*/}"
+  # Reviewers native to the lead run as its own subagent (first choice or fallback).
+  local before="" handoff=""
+  for m in $cand; do
+    [ "$(placement "$m")" = subagent ] && { handoff="$m"; break; }
+    before="$before $m"
+  done
+  if [ -n "$before" ]; then
+    echo "[orchestra] reviewing $target (author $author)" >&2
+    run_role "model:${before# }" "$rd/review" "$cwd" plan "$prompt" "$rd/diff.patch"
+    if [ -z "${ALL_FAILED:-}" ]; then
+      cp "$LAST_LOG" "$rd/review.md" 2>/dev/null
+      echo "[orchestra] review of $target by $USED_MODEL ($(grep -c '^' "$rd/diff.patch") diff lines)"
+      extract "$rd/review.md" FINDINGS 16
+      echo "full review: ${rd#$root/}/review.md"
+      return 0
+    fi
+    [ -n "$handoff" ] || require_ran
+  fi
+  if [ -n "$handoff" ]; then
+    [ -n "$before" ] && echo "  → $handoff [subagent]" >&2
+    local nm ce=default; nm="$(native_model "$handoff")"
+    [ "${handoff#*#}" != "$handoff" ] && ce="${handoff#*#}"
     printf '%s\n' "$prompt" >"$rd/review-prompt.md"
-    local ce=default; [ "${cm#*#}" != "$cm" ] && ce="${cm#*#}"
-    echo "NATIVE_REVIEW kind=$(model_kind "$first") model=${cm%%#*} effort=$ce"
+    echo "NATIVE_REVIEW kind=$(lead_agent) model=$nm effort=$ce"
     echo "  diff:   $rd/diff.patch ($(grep -c '^' "$rd/diff.patch") lines)"
     echo "  cwd:    $cwd"
     echo "  prompt: $rd/review-prompt.md"
@@ -833,12 +876,6 @@ If there are no real problems, write \"FINDINGS:\" then \"- none\"."
     echo "save its reply to the save path, then report its FINDINGS."
     return 0
   fi
-  echo "[orchestra] reviewing $target (author $author)" >&2
-  run_role "model:$cand" "$rd/review" "$cwd" plan "$prompt" "$rd/diff.patch"; require_ran
-  cp "$LAST_LOG" "$rd/review.md" 2>/dev/null
-  echo "[orchestra] review of $target by $USED_MODEL ($(grep -c '^' "$rd/diff.patch") diff lines)"
-  extract "$rd/review.md" FINDINGS 16
-  echo "full review: ${rd#$root/}/review.md"
 }
 
 # -------------------------------------------------------------------- ask ----
@@ -856,10 +893,37 @@ cmd_ask() {
   local prompt="$q
 
 Do not modify any files. Be concise and concrete (file paths, line numbers). End with \"ANSWER:\" followed by your conclusion in at most $MAX_LINES lines."
-  run_role "$spec" "$rd/$id" "$cwd" plan "$prompt" "$file"; require_ran
-  echo "[orchestra] answer from $USED_MODEL"
-  extract "$LAST_LOG" ANSWER "$MAX_LINES"
-  echo "full answer: $LAST_LOG"
+  local usable before="" handoff="" m
+  usable="$(usable_models "$spec")"
+  for m in $usable; do
+    [ "$(placement "$m")" = subagent ] && { handoff="$m"; break; }
+    before="$before $m"
+  done
+  if [ -n "$before" ]; then
+    run_role "model:${before# }" "$rd/$id" "$cwd" plan "$prompt" "$file"
+    if [ -z "${ALL_FAILED:-}" ]; then
+      echo "[orchestra] answer from $USED_MODEL"
+      extract "$LAST_LOG" ANSWER "$MAX_LINES"
+      echo "full answer: $LAST_LOG"
+      return 0
+    fi
+    [ -n "$handoff" ] || require_ran
+  fi
+  if [ -n "$handoff" ]; then
+    [ -n "$before" ] && echo "  → $handoff [subagent]" >&2
+    local nm ce=default; nm="$(native_model "$handoff")"
+    [ "${handoff#*#}" != "$handoff" ] && ce="${handoff#*#}"
+    printf '%s\n' "$prompt" >"$rd/$id-prompt.md"
+    echo "NATIVE_ASK kind=$(lead_agent) model=$nm effort=$ce"
+    echo "  cwd:    $cwd"
+    [ -n "$file" ] && echo "  file:   $file"
+    echo "  prompt: $rd/$id-prompt.md"
+    echo "  save:   $rd/$id.md"
+    echo "Spawn a read-only subagent with that model/effort, working directory cwd: give it the prompt"
+    echo "(and file if listed), save its reply to the save path, then report its ANSWER."
+    return 0
+  fi
+  require_ran
 }
 
 # ------------------------------------------------------------ status/clean ----

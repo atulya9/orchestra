@@ -35,7 +35,7 @@ orchestra docker login claude            # interactive; one per CLI you route wo
 Prefer your own machine's CLIs and logins? `orchestra models set runtime host` skips Docker.
 
 `install.sh` symlinks `~/.local/bin/orchestra` and the skills (into `~/.agents/skills`, plus
-`~/.claude/skills` and `~/.codex/skills`), seeds `~/.config/orchestra/` from `templates/` without
+`~/.claude/skills`, `~/.codex/skills` and `~/.gemini/config/skills`), seeds `~/.config/orchestra/` from `templates/` without
 overwriting anything, and keeps the orchestra block in `~/.agents/AGENTS.md` current. Re-run it after
 pulling; since everything is linked, edits in this checkout are live.
 
@@ -75,9 +75,12 @@ The lead is detected from the env its shell commands get: `CLAUDECODE` (Claude C
 `CODEX_THREAD_ID` / `CODEX_SESSION_ID` (Codex), `GROK_SESSION_ID`, `ANTIGRAVITY_CONVERSATION_ID`,
 `OPENCODE_SESSION_ID`; override with `ORCHESTRA_LEAD`.
 
-Where a model runs, native first: the lead's own kind runs as its subagent (Claude Code) or its own CLI
-on the host (Codex, Grok, agy); everything else runs in the runtime (`docker` by default: repo mounted
-read-only, only the task's worktree writable; or `host`).
+Where a model runs, native first: leads with native subagents (`claude`, `agy`, `codex`)
+hand off their own models — plus any cross-CLI models mapped via `native.<kind>/<model>` in
+`harness/<lead>.conf` — as `NATIVE_DELEGATE` / `NATIVE_REVIEW` / `NATIVE_ASK` subagents (set `subagent = off` or
+`native.<kind>/<model> = off` to force the CLI); other leads (`grok`, `opencode`) use their own CLI on the host; everything
+else runs in the runtime (`docker` by default: repo mounted read-only, only the task's worktree
+writable; or `host`).
 
 ## Development
 

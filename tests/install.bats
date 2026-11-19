@@ -5,7 +5,7 @@ REPO="$BATS_TEST_DIRNAME/.."
 setup() {
   export HOME="$BATS_TEST_TMPDIR/home"
   unset XDG_CONFIG_HOME ORCHESTRA_BIN_DIR ORCHESTRA_AGENTS_DIR ORCHESTRA_SKILL_LINKS
-  mkdir -p "$HOME/.claude" "$HOME/.codex"
+  mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini/config"
 }
 
 @test "fresh install links the CLI and skills and seeds config" {
@@ -15,6 +15,7 @@ setup() {
   [ -L "$HOME/.agents/skills/orchestrate" ]
   [ "$(readlink "$HOME/.claude/skills/orchestrate")" = "$HOME/.agents/skills/orchestrate" ]
   [ "$(readlink "$HOME/.codex/skills/orchestrate")" = "$HOME/.agents/skills/orchestrate" ]
+  [ "$(readlink "$HOME/.gemini/config/skills/orchestrate")" = "$HOME/.agents/skills/orchestrate" ]
   [ -f "$HOME/.config/orchestra/models.conf" ]
   [ -f "$HOME/.config/orchestra/harness/claude.conf" ]
   grep -q '<!-- orchestra:begin -->' "$HOME/.agents/AGENTS.md"

@@ -61,6 +61,10 @@ session_id() { jq -R -r 'fromjson? | objects | (.conversation_id // .sessionID /
 
 @test "placement: the lead's own kind runs natively" {
   [ "$(CLAUDECODE=1 placement claude/opus)" = subagent ]
-  [ "$(CODEX_THREAD_ID=x placement codex/model-a)" = host ]
+  [ "$(ANTIGRAVITY_CONVERSATION_ID=x placement agy/pro)" = subagent ]
+  [ "$(CODEX_THREAD_ID=x placement codex/model-a)" = subagent ]
+  [ "$(OPENCODE_SESSION_ID=x placement opencode/model-b)" = host ]
+  [ "$(GROK_SESSION_ID=x placement grok/grok-x)" = host ]
   [ "$(CODEX_THREAD_ID=x placement claude/opus)" = runtime ]
+  [ "$(ANTIGRAVITY_CONVERSATION_ID=x placement codex/model-a)" = runtime ]
 }

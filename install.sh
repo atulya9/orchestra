@@ -47,6 +47,9 @@ case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "note    $BIN_DIR is not on PATH" ;;
 echo "Skills"
 skill_dirs="$AGENTS_DIR/skills"
 for d in "$HOME/.claude" "$HOME/.codex"; do [ -d "$d" ] && skill_dirs="$skill_dirs $d/skills"; done
+if [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity" ]; then
+  skill_dirs="$skill_dirs $HOME/.gemini/config/skills"
+fi
 skill_dirs="$skill_dirs ${ORCHESTRA_SKILL_LINKS:-}"
 for s in "$REPO"/skills/*/; do
   s="$(basename "$s")"
